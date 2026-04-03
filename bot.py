@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 NOTION_TOKEN   = os.environ["NOTION_TOKEN"]
-NOTION_DB_ID   = "336a2a4f-d113-808f-88e9-000b2ae5fba0"
+NOTION_DB_ID   = "336a2a4fd11380419b1ae2907a8ba216"
 
 # 狀態名稱常數
 S_WAIT_CONTENT    = "wait_content"
