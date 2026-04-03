@@ -95,16 +95,22 @@ async def analyze_with_gemini(content: str, url: str, platform: str) -> dict:
         logger.error(f"Gemini 失敗: {e}")
         return {"建議主題": "未能自動分析", "建議工具": [], "建議重點": [], "分析說明": "請手動填寫"}
 
-async def save_to_notion(title: str, tools: list, focus: list) -> bool:
+async def save_to_notion(title: str, url: str, tools: list, focus: list) -> bool:
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28"
     }
+    # 標題用超連結格式（若有連結則插入 Ctrl+K 超連結，否則純文字）
+    if url:
+        title_content = [{"type": "text", "text": {"content": title, "link": {"url": url}}}]
+    else:
+        title_content = [{"type": "text", "text": {"content": title}}]
+
     body = {
         "parent": {"database_id": NOTION_DB_ID},
         "properties": {
-            "收藏貼文主題": {"title": [{"type": "text", "text": {"content": title}}]},
+            "收藏貼文主題": {"title": title_content},
             "貼文適用工具": {"multi_select": [{"name": t} for t in tools]},
             "貼文重點":     {"multi_select": [{"name": f} for f in focus]},
         }
@@ -157,7 +163,7 @@ async def send_ask_focus(update, ctx):
 async def send_ask_title(update, ctx):
     suggested = ctx.user_data.get("analysis", {}).get("建議主題", "")
     url = ctx.user_data.get("url", "")
-    draft = f"{suggested}｜{url}" if url else suggested
+    draft = suggested  # 主題只存純文字，連結另外存在 url 欄位
     ctx.user_data["draft_title"] = draft
     set_state(ctx, S_REVIEW_TITLE)
     await update.message.reply_text(
@@ -168,12 +174,14 @@ async def send_ask_title(update, ctx):
 
 async def send_summary(update, ctx):
     title = ctx.user_data.get("draft_title", "")
+    url = ctx.user_data.get("url", "")
     tools = ctx.user_data.get("sel_tools", [])
     focus = ctx.user_data.get("sel_focus", [])
     set_state(ctx, S_FINAL_CONFIRM)
+    url_display = f"\n🔗 連結：{url}" if url else ""
     await update.message.reply_text(
         f"📋 *最終確認*\n\n"
-        f"🏷 主題：{title}\n"
+        f"🏷 主題：{title}{url_display}\n"
         f"🛠 工具：{', '.join(tools)}\n"
         f"🎯 重點：{', '.join(focus)}\n\n"
         f"確認存入 Notion 嗎？",
@@ -311,7 +319,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── 輸入新主題 ─────────────────────────────────────────────────────────────
     elif state == S_INPUT_NEW_TITLE:
         url = ctx.user_data.get("url", "")
-        ctx.user_data["draft_title"] = f"{text}｜{url}" if url else text
+        ctx.user_data["draft_title"] = text  # 主題只存純文字，連結另外存在 url 欄位
         await update.message.reply_text(
             f"✅ 已更新主題：\n`{ctx.user_data['draft_title']}`",
             parse_mode="Markdown"
@@ -331,6 +339,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⏳ 寫入 Notion 中...")
             ok = await save_to_notion(
                 ctx.user_data.get("draft_title", ""),
+                ctx.user_data.get("url", ""),
                 ctx.user_data.get("sel_tools", []),
                 ctx.user_data.get("sel_focus", [])
             )
