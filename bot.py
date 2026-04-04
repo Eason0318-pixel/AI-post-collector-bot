@@ -1,7 +1,8 @@
 """
-社群貼文收藏 Bot v8
-- YouTube 改用 YouTube Data API v3（穩定版）
-- 支援 Threads、YouTube（API 抓取）、IG（手動貼文字）
+社群貼文收藏 Bot v9
+- 修復：Threads 抓取 regex
+- 修復：選項清單顯示不完整
+- 支援 Threads、YouTube（API）、IG（手動）
 - 純狀態機，無 Markdown parse_mode
 """
 
@@ -29,60 +30,75 @@ ST_REVIEW_TITLE    = 7
 ST_INPUT_NEW_TITLE = 8
 ST_FINAL_CONFIRM   = 9
 
-TOOLS_OPTIONS = ["Claude", "Gemini", "Notion"]
-FOCUS_OPTIONS = ["AI版本更新", "Vibe coding", "實用功能"]
+# 預設選項（不可刪除，新增的選項存在 user_data 裡）
+DEFAULT_TOOLS = ["Claude", "Gemini", "Notion"]
+DEFAULT_FOCUS = ["AI版本更新", "Vibe coding", "實用功能"]
 
-def get_st(ctx): return ctx.user_data.get("st", ST_WAIT_CONTENT)
-def set_st(ctx, s): ctx.user_data["st"] = s
+def get_st(ctx):   return ctx.user_data.get("st", ST_WAIT_CONTENT)
+def set_st(ctx,s): ctx.user_data["st"] = s
 
-def is_threads(t):  return bool(re.search(r"threads\.(net|com)", t, re.I))
-def is_ig(t):       return bool(re.search(r"instagram\.com|ig\.me", t, re.I))
-def is_youtube(t):  return bool(re.search(r"youtube\.com/watch|youtu\.be/", t, re.I))
+# 取得當次對話的選項清單（含新增的）
+def get_tools(ctx): return ctx.user_data.get("all_tools", list(DEFAULT_TOOLS))
+def get_focus(ctx): return ctx.user_data.get("all_focus", list(DEFAULT_FOCUS))
 
-def extract_youtube_video_id(url):
-    m = re.search(r"youtu\.be/([^?&]+)", url)
+def is_threads(t): return bool(re.search(r"threads\.(net|com)", t, re.I))
+def is_ig(t):      return bool(re.search(r"instagram\.com|ig\.me", t, re.I))
+def is_youtube(t): return bool(re.search(r"youtube\.com/watch|youtu\.be/", t, re.I))
+
+def extract_yt_id(url):
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]+)", url)
     if m: return m.group(1)
-    m = re.search(r"youtube\.com/watch\?.*v=([^&]+)", url)
+    m = re.search(r"youtube\.com/watch\?.*v=([A-Za-z0-9_-]+)", url)
     if m: return m.group(1)
     return None
 
 async def fetch_youtube(url):
-    video_id = extract_youtube_video_id(url)
-    if not video_id:
+    vid = extract_yt_id(url)
+    if not vid:
         return ""
     try:
-        api_url = (
-            "https://www.googleapis.com/youtube/v3/videos"
-            "?part=snippet"
-            "&id=" + video_id +
-            "&key=" + YOUTUBE_API_KEY
-        )
+        api = "https://www.googleapis.com/youtube/v3/videos?part=snippet&id=" + vid + "&key=" + YOUTUBE_API_KEY
         async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(api_url)
+            r = await c.get(api)
             r.raise_for_status()
-            data = r.json()
-            items = data.get("items", [])
+            items = r.json().get("items", [])
             if not items:
                 return ""
-            snippet = items[0]["snippet"]
-            title       = snippet.get("title", "")
-            channel     = snippet.get("channelTitle", "")
-            description = snippet.get("description", "")[:300]
-            return title + "\n頻道：" + channel + "\n" + description
+            s = items[0]["snippet"]
+            title   = s.get("title", "")
+            channel = s.get("channelTitle", "")
+            desc    = s.get("description", "")[:300]
+            return title + "\n頻道：" + channel + "\n" + desc
     except Exception as e:
-        logger.error("YouTube API 失敗: " + str(e))
-        return ""
+        logger.error("YouTube 失敗: " + str(e))
+    return ""
 
 async def fetch_threads(url):
+    """抓取 Threads 貼文內容，使用多種 pattern 確保成功"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    }
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as c:
-            r = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            for attr in ["og:description", "og:title"]:
-                pat = "property=" + attr + "[^>]+content=.([^>]{5,}?)."
-                m = re.search(pat, r.text)
-                if m: return m.group(1).strip()
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
+            r = await c.get(url, headers=headers)
+            html = r.text
+            # 嘗試多種抓取方式
+            patterns = [
+                r'"og:description"[^>]*content="([^"]{10,})"',
+                r'content="([^"]{10,})"[^>]*property="og:description"',
+                r'<meta[^>]*name="description"[^>]*content="([^"]{10,})"',
+                r'"description":"([^"]{10,})"',
+            ]
+            for p in patterns:
+                m = re.search(p, html)
+                if m:
+                    result = m.group(1).strip()
+                    # 過濾掉太通用的描述
+                    if "Threads" not in result or len(result) > 50:
+                        return result
     except Exception as e:
-        logger.error("Threads 抓取失敗: " + str(e))
+        logger.error("Threads 失敗: " + str(e))
     return ""
 
 async def call_gemini(content, url, platform):
@@ -143,9 +159,10 @@ def kb(opts, extras=None):
     return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
 
 async def show_tools(update, ctx):
+    all_tools = get_tools(ctx)
     sel = ctx.user_data.get("sel_tools", [])
     sug = ctx.user_data.get("analysis", {}).get("建議工具", [])
-    rem = [t for t in TOOLS_OPTIONS if t not in sel]
+    rem = [t for t in all_tools if t not in sel]
     hint = "（建議：" + ", ".join(sug) + "）" if sug and not sel else ""
     set_st(ctx, ST_SELECT_TOOLS)
     await update.message.reply_text(
@@ -154,9 +171,10 @@ async def show_tools(update, ctx):
     )
 
 async def show_focus(update, ctx):
+    all_focus = get_focus(ctx)
     sel = ctx.user_data.get("sel_focus", [])
     sug = ctx.user_data.get("analysis", {}).get("建議重點", [])
-    rem = [f for f in FOCUS_OPTIONS if f not in sel]
+    rem = [f for f in all_focus if f not in sel]
     hint = "（建議：" + ", ".join(sug) + "）" if sug and not sel else ""
     set_st(ctx, ST_SELECT_FOCUS)
     await update.message.reply_text(
@@ -199,6 +217,11 @@ async def do_analysis(update, ctx):
     ctx.user_data["analysis"]  = result
     ctx.user_data["sel_tools"] = []
     ctx.user_data["sel_focus"] = []
+    # 初始化選項清單（保留跨貼文的新增選項）
+    if "all_tools" not in ctx.user_data:
+        ctx.user_data["all_tools"] = list(DEFAULT_TOOLS)
+    if "all_focus" not in ctx.user_data:
+        ctx.user_data["all_focus"] = list(DEFAULT_FOCUS)
     platform = ctx.user_data["platform"]
     if platform == "Threads":   emoji = "🧵"
     elif platform == "YouTube": emoji = "▶️"
@@ -234,10 +257,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             ctx.user_data.update({"platform": "Instagram", "content": text, "url": ""})
             set_st(ctx, ST_WAIT_IG_LINK)
-            await update.message.reply_text(
-                "📎 請提供這篇貼文的 IG 連結：",
-                reply_markup=ReplyKeyboardRemove()
-            )
+            await update.message.reply_text("📎 請提供這篇貼文的 IG 連結：", reply_markup=ReplyKeyboardRemove())
 
     elif st == ST_WAIT_IG_LINK:
         ctx.user_data["url"] = text
@@ -254,13 +274,15 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             set_st(ctx, ST_INPUT_NEW_TOOL)
             await update.message.reply_text("✏️ 請輸入新工具名稱：", reply_markup=ReplyKeyboardRemove())
         else:
-            if text in TOOLS_OPTIONS and text not in ctx.user_data.get("sel_tools", []):
+            all_tools = get_tools(ctx)
+            if text in all_tools and text not in ctx.user_data.get("sel_tools", []):
                 ctx.user_data.setdefault("sel_tools", []).append(text)
             await show_tools(update, ctx)
 
     elif st == ST_INPUT_NEW_TOOL:
-        if text not in TOOLS_OPTIONS:
-            TOOLS_OPTIONS.append(text)
+        ctx.user_data.setdefault("all_tools", list(DEFAULT_TOOLS))
+        if text not in ctx.user_data["all_tools"]:
+            ctx.user_data["all_tools"].append(text)
         ctx.user_data.setdefault("sel_tools", [])
         if text not in ctx.user_data["sel_tools"]:
             ctx.user_data["sel_tools"].append(text)
@@ -278,13 +300,15 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             set_st(ctx, ST_INPUT_NEW_FOCUS)
             await update.message.reply_text("✏️ 請輸入新重點名稱：", reply_markup=ReplyKeyboardRemove())
         else:
-            if text in FOCUS_OPTIONS and text not in ctx.user_data.get("sel_focus", []):
+            all_focus = get_focus(ctx)
+            if text in all_focus and text not in ctx.user_data.get("sel_focus", []):
                 ctx.user_data.setdefault("sel_focus", []).append(text)
             await show_focus(update, ctx)
 
     elif st == ST_INPUT_NEW_FOCUS:
-        if text not in FOCUS_OPTIONS:
-            FOCUS_OPTIONS.append(text)
+        ctx.user_data.setdefault("all_focus", list(DEFAULT_FOCUS))
+        if text not in ctx.user_data["all_focus"]:
+            ctx.user_data["all_focus"].append(text)
         ctx.user_data.setdefault("sel_focus", [])
         if text not in ctx.user_data["sel_focus"]:
             ctx.user_data["sel_focus"].append(text)
@@ -315,19 +339,22 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ctx.user_data.get("sel_focus", [])
             )
             if ok:
-                await update.message.reply_text(
-                    "🎉 成功存入 Notion！\n\n下一篇貼文傳過來就好 👋",
-                    reply_markup=ReplyKeyboardRemove()
-                )
+                await update.message.reply_text("🎉 成功存入 Notion！\n\n下一篇傳過來就好 👋", reply_markup=ReplyKeyboardRemove())
             else:
-                await update.message.reply_text(
-                    "❌ Notion 寫入失敗，請確認 NOTION_TOKEN 是否正確。",
-                    reply_markup=ReplyKeyboardRemove()
-                )
+                await update.message.reply_text("❌ Notion 寫入失敗，請確認 NOTION_TOKEN 是否正確。", reply_markup=ReplyKeyboardRemove())
+            # 保留 all_tools / all_focus，只清除當次資料
+            saved_tools = ctx.user_data.get("all_tools")
+            saved_focus = ctx.user_data.get("all_focus")
             ctx.user_data.clear()
+            if saved_tools: ctx.user_data["all_tools"] = saved_tools
+            if saved_focus: ctx.user_data["all_focus"] = saved_focus
             set_st(ctx, ST_WAIT_CONTENT)
         elif text == "❌ 取消":
+            saved_tools = ctx.user_data.get("all_tools")
+            saved_focus = ctx.user_data.get("all_focus")
             ctx.user_data.clear()
+            if saved_tools: ctx.user_data["all_tools"] = saved_tools
+            if saved_focus: ctx.user_data["all_focus"] = saved_focus
             set_st(ctx, ST_WAIT_CONTENT)
             await update.message.reply_text("已取消。有需要再傳貼文給我 🙂", reply_markup=ReplyKeyboardRemove())
         else:
@@ -350,7 +377,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    saved_tools = ctx.user_data.get("all_tools")
+    saved_focus = ctx.user_data.get("all_focus")
     ctx.user_data.clear()
+    if saved_tools: ctx.user_data["all_tools"] = saved_tools
+    if saved_focus: ctx.user_data["all_focus"] = saved_focus
     set_st(ctx, ST_WAIT_CONTENT)
     await update.message.reply_text("已取消，重新開始。", reply_markup=ReplyKeyboardRemove())
 
@@ -359,7 +390,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    logger.info("Bot v8 啟動中...")
+    logger.info("Bot v9 啟動中...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
