@@ -1,7 +1,6 @@
 """
-社群貼文收藏 Bot v9
-- 修復：Threads 抓取 regex
-- 修復：選項清單顯示不完整
+社群貼文收藏 Bot v10
+- 啟動時從 Notion API 動態讀取選項，永遠與 Notion 同步
 - 支援 Threads、YouTube（API）、IG（手動）
 - 純狀態機，無 Markdown parse_mode
 """
@@ -14,11 +13,12 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
-NOTION_TOKEN    = os.environ["NOTION_TOKEN"]
-YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
-NOTION_DB_ID    = "336a2a4fd11380419b1ae2907a8ba216"
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+GEMINI_API_KEY   = os.environ["GEMINI_API_KEY"]
+NOTION_TOKEN     = os.environ["NOTION_TOKEN"]
+YOUTUBE_API_KEY  = os.environ["YOUTUBE_API_KEY"]
+NOTION_DB_ID     = "336a2a4fd11380419b1ae2907a8ba216"
+NOTION_SOURCE_ID = "336a2a4f-d113-808f-88e9-000b2ae5fba0"
 
 ST_WAIT_CONTENT    = 1
 ST_WAIT_IG_LINK    = 2
@@ -30,16 +30,61 @@ ST_REVIEW_TITLE    = 7
 ST_INPUT_NEW_TITLE = 8
 ST_FINAL_CONFIRM   = 9
 
-# 預設選項（不可刪除，新增的選項存在 user_data 裡）
+# 預設選項（啟動時會被 Notion 的真實選項覆蓋）
 DEFAULT_TOOLS = ["Claude", "Gemini", "Notion"]
-DEFAULT_FOCUS = ["AI版本更新", "Vibe coding", "實用功能"]
+DEFAULT_FOCUS = ["AI版本更新", "Vibe coding", "實用功能", "Computer Use",
+                 "AI基礎教學", "Claude + Gemini協作", "Claude code教學", "免費課程", "Gemma4"]
+
+# 全域選項（啟動時從 Notion 讀取）
+GLOBAL_TOOLS = list(DEFAULT_TOOLS)
+GLOBAL_FOCUS = list(DEFAULT_FOCUS)
+
+# ── 啟動時從 Notion 讀取選項 ───────────────────────────────────────────────────
+async def load_options_from_notion():
+    global GLOBAL_TOOLS, GLOBAL_FOCUS
+    try:
+        url = "https://api.notion.com/v1/databases/" + NOTION_DB_ID
+        headers = {
+            "Authorization": "Bearer " + NOTION_TOKEN,
+            "Notion-Version": "2022-06-28"
+        }
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(url, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            props = data.get("properties", {})
+
+            tools_prop = props.get("貼文適用工具", {})
+            tools = [o["name"] for o in tools_prop.get("multi_select", {}).get("options", [])]
+            if tools:
+                GLOBAL_TOOLS = tools
+                logger.info("從 Notion 載入工具選項：" + str(tools))
+
+            focus_prop = props.get("貼文重點", {})
+            focus = [o["name"] for o in focus_prop.get("multi_select", {}).get("options", [])]
+            if focus:
+                GLOBAL_FOCUS = focus
+                logger.info("從 Notion 載入重點選項：" + str(focus))
+    except Exception as e:
+        logger.error("從 Notion 讀取選項失敗，使用預設值：" + str(e))
 
 def get_st(ctx):   return ctx.user_data.get("st", ST_WAIT_CONTENT)
 def set_st(ctx,s): ctx.user_data["st"] = s
 
-# 取得當次對話的選項清單（含新增的）
-def get_tools(ctx): return ctx.user_data.get("all_tools", list(DEFAULT_TOOLS))
-def get_focus(ctx): return ctx.user_data.get("all_focus", list(DEFAULT_FOCUS))
+def get_tools(ctx):
+    # 用全域選項，加上本次對話新增的
+    base = list(GLOBAL_TOOLS)
+    for t in ctx.user_data.get("extra_tools", []):
+        if t not in base:
+            base.append(t)
+    return base
+
+def get_focus(ctx):
+    base = list(GLOBAL_FOCUS)
+    for f in ctx.user_data.get("extra_focus", []):
+        if f not in base:
+            base.append(f)
+    return base
 
 def is_threads(t): return bool(re.search(r"threads\.(net|com)", t, re.I))
 def is_ig(t):      return bool(re.search(r"instagram\.com|ig\.me", t, re.I))
@@ -54,27 +99,21 @@ def extract_yt_id(url):
 
 async def fetch_youtube(url):
     vid = extract_yt_id(url)
-    if not vid:
-        return ""
+    if not vid: return ""
     try:
         api = "https://www.googleapis.com/youtube/v3/videos?part=snippet&id=" + vid + "&key=" + YOUTUBE_API_KEY
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(api)
             r.raise_for_status()
             items = r.json().get("items", [])
-            if not items:
-                return ""
+            if not items: return ""
             s = items[0]["snippet"]
-            title   = s.get("title", "")
-            channel = s.get("channelTitle", "")
-            desc    = s.get("description", "")[:300]
-            return title + "\n頻道：" + channel + "\n" + desc
+            return s.get("title","") + "\n頻道：" + s.get("channelTitle","") + "\n" + s.get("description","")[:300]
     except Exception as e:
         logger.error("YouTube 失敗: " + str(e))
     return ""
 
 async def fetch_threads(url):
-    """抓取 Threads 貼文內容，使用多種 pattern 確保成功"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
@@ -82,8 +121,6 @@ async def fetch_threads(url):
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
             r = await c.get(url, headers=headers)
-            html = r.text
-            # 嘗試多種抓取方式
             patterns = [
                 r'"og:description"[^>]*content="([^"]{10,})"',
                 r'content="([^"]{10,})"[^>]*property="og:description"',
@@ -91,24 +128,25 @@ async def fetch_threads(url):
                 r'"description":"([^"]{10,})"',
             ]
             for p in patterns:
-                m = re.search(p, html)
+                m = re.search(p, r.text)
                 if m:
                     result = m.group(1).strip()
-                    # 過濾掉太通用的描述
-                    if "Threads" not in result or len(result) > 50:
+                    if len(result) > 30:
                         return result
     except Exception as e:
         logger.error("Threads 失敗: " + str(e))
     return ""
 
 async def call_gemini(content, url, platform):
+    tools_list = ", ".join(GLOBAL_TOOLS)
+    focus_list = ", ".join(GLOBAL_FOCUS)
     prompt = (
         "分析以下 " + platform + " 內容，只回傳 JSON 不要其他文字：\n"
         "內容：" + content + "\n"
         "連結：" + url + "\n"
         '{"建議主題":"簡短中文標題15字以內",'
-        '"建議工具":["從 Claude Gemini Notion 選相關的"],'
-        '"建議重點":["從 AI版本更新 Vibe coding 實用功能 選相關的"],'
+        '"建議工具":["從 ' + tools_list + ' 選相關的"],'
+        '"建議重點":["從 ' + focus_list + ' 選相關的"],'
         '"分析說明":"一句話摘要"}'
     )
     try:
@@ -148,6 +186,8 @@ async def write_notion(title, url, tools, focus):
                 }
             )
             r.raise_for_status()
+            # 寫入成功後重新讀取選項（同步新增的選項到 Notion）
+            await load_options_from_notion()
             return True
     except Exception as e:
         logger.error("Notion 失敗: " + str(e))
@@ -217,11 +257,6 @@ async def do_analysis(update, ctx):
     ctx.user_data["analysis"]  = result
     ctx.user_data["sel_tools"] = []
     ctx.user_data["sel_focus"] = []
-    # 初始化選項清單（保留跨貼文的新增選項）
-    if "all_tools" not in ctx.user_data:
-        ctx.user_data["all_tools"] = list(DEFAULT_TOOLS)
-    if "all_focus" not in ctx.user_data:
-        ctx.user_data["all_focus"] = list(DEFAULT_FOCUS)
     platform = ctx.user_data["platform"]
     if platform == "Threads":   emoji = "🧵"
     elif platform == "YouTube": emoji = "▶️"
@@ -274,15 +309,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             set_st(ctx, ST_INPUT_NEW_TOOL)
             await update.message.reply_text("✏️ 請輸入新工具名稱：", reply_markup=ReplyKeyboardRemove())
         else:
-            all_tools = get_tools(ctx)
-            if text in all_tools and text not in ctx.user_data.get("sel_tools", []):
+            if text in get_tools(ctx) and text not in ctx.user_data.get("sel_tools", []):
                 ctx.user_data.setdefault("sel_tools", []).append(text)
             await show_tools(update, ctx)
 
     elif st == ST_INPUT_NEW_TOOL:
-        ctx.user_data.setdefault("all_tools", list(DEFAULT_TOOLS))
-        if text not in ctx.user_data["all_tools"]:
-            ctx.user_data["all_tools"].append(text)
+        ctx.user_data.setdefault("extra_tools", [])
+        if text not in get_tools(ctx):
+            ctx.user_data["extra_tools"].append(text)
         ctx.user_data.setdefault("sel_tools", [])
         if text not in ctx.user_data["sel_tools"]:
             ctx.user_data["sel_tools"].append(text)
@@ -300,15 +334,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             set_st(ctx, ST_INPUT_NEW_FOCUS)
             await update.message.reply_text("✏️ 請輸入新重點名稱：", reply_markup=ReplyKeyboardRemove())
         else:
-            all_focus = get_focus(ctx)
-            if text in all_focus and text not in ctx.user_data.get("sel_focus", []):
+            if text in get_focus(ctx) and text not in ctx.user_data.get("sel_focus", []):
                 ctx.user_data.setdefault("sel_focus", []).append(text)
             await show_focus(update, ctx)
 
     elif st == ST_INPUT_NEW_FOCUS:
-        ctx.user_data.setdefault("all_focus", list(DEFAULT_FOCUS))
-        if text not in ctx.user_data["all_focus"]:
-            ctx.user_data["all_focus"].append(text)
+        ctx.user_data.setdefault("extra_focus", [])
+        if text not in get_focus(ctx):
+            ctx.user_data["extra_focus"].append(text)
         ctx.user_data.setdefault("sel_focus", [])
         if text not in ctx.user_data["sel_focus"]:
             ctx.user_data["sel_focus"].append(text)
@@ -342,19 +375,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("🎉 成功存入 Notion！\n\n下一篇傳過來就好 👋", reply_markup=ReplyKeyboardRemove())
             else:
                 await update.message.reply_text("❌ Notion 寫入失敗，請確認 NOTION_TOKEN 是否正確。", reply_markup=ReplyKeyboardRemove())
-            # 保留 all_tools / all_focus，只清除當次資料
-            saved_tools = ctx.user_data.get("all_tools")
-            saved_focus = ctx.user_data.get("all_focus")
             ctx.user_data.clear()
-            if saved_tools: ctx.user_data["all_tools"] = saved_tools
-            if saved_focus: ctx.user_data["all_focus"] = saved_focus
             set_st(ctx, ST_WAIT_CONTENT)
         elif text == "❌ 取消":
-            saved_tools = ctx.user_data.get("all_tools")
-            saved_focus = ctx.user_data.get("all_focus")
             ctx.user_data.clear()
-            if saved_tools: ctx.user_data["all_tools"] = saved_tools
-            if saved_focus: ctx.user_data["all_focus"] = saved_focus
             set_st(ctx, ST_WAIT_CONTENT)
             await update.message.reply_text("已取消。有需要再傳貼文給我 🙂", reply_markup=ReplyKeyboardRemove())
         else:
@@ -368,6 +392,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     set_st(ctx, ST_WAIT_CONTENT)
+    await load_options_from_notion()
     await update.message.reply_text(
         "👋 嗨！我是你的內容收藏助手。\n\n請傳給我：\n"
         "• Threads 連結（自動抓內容）\n"
@@ -377,20 +402,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    saved_tools = ctx.user_data.get("all_tools")
-    saved_focus = ctx.user_data.get("all_focus")
     ctx.user_data.clear()
-    if saved_tools: ctx.user_data["all_tools"] = saved_tools
-    if saved_focus: ctx.user_data["all_focus"] = saved_focus
     set_st(ctx, ST_WAIT_CONTENT)
     await update.message.reply_text("已取消，重新開始。", reply_markup=ReplyKeyboardRemove())
 
+async def post_init(app):
+    await load_options_from_notion()
+
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    logger.info("Bot v9 啟動中...")
+    logger.info("Bot v10 啟動中...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
