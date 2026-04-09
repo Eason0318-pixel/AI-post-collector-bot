@@ -1,4 +1,4 @@
-import os, json, logging, re
+import os, json, logging, re, locale
 import httpx
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -42,6 +42,17 @@ DEFAULT_FOCUS = [
 GLOBAL_TOOLS = list(DEFAULT_TOOLS)
 GLOBAL_FOCUS = list(DEFAULT_FOCUS)
 
+def setup_locale():
+    """設定中文筆畫排序（locale）"""
+    for loc in ["zh_TW.UTF-8", "zh_CN.UTF-8", "zh_TW", "zh_CN", "C.UTF-8", ""]:
+        try:
+            locale.setlocale(locale.LC_COLLATE, loc)
+            break
+        except locale.Error:
+            continue
+
+setup_locale()
+
 async def load_options_from_notion():
     global GLOBAL_TOOLS, GLOBAL_FOCUS
     try:
@@ -67,13 +78,13 @@ def get_tools(ctx):
     base = list(GLOBAL_TOOLS)
     for t in ctx.user_data.get("extra_tools", []):
         if t not in base: base.append(t)
-    return base
+    return sorted(base, key=lambda x: locale.strxfrm(x))
 
 def get_focus(ctx):
     base = list(GLOBAL_FOCUS)
     for f in ctx.user_data.get("extra_focus", []):
         if f not in base: base.append(f)
-    return base
+    return sorted(base, key=lambda x: locale.strxfrm(x))
 
 def _opts_rows(opts):
     padded = opts[:]
